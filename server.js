@@ -121,7 +121,29 @@ app.post('/api/verificar-vsl', async (req, res) => {
     const resultadoClique = await tentarCliqueNoPlayer(page);
     cliqueRealizado = true;
 
-    await page.waitForTimeout(12000);
+    await page.waitForTimeout(20000);
+
+    const infoPlayersNaTela = await page.evaluate(() => {
+      const elementos = document.querySelectorAll('vturb-smartplayer');
+      const resultado = [];
+      elementos.forEach((el) => {
+        const idAttr = el.id || '';
+        const videoIdExtraido = idAttr.replace(/^vid-?/i, '');
+        const rect = el.getBoundingClientRect();
+        const estilo = window.getComputedStyle(el);
+        const visivel = rect.width > 0 && rect.height > 0 &&
+          estilo.display !== 'none' &&
+          estilo.visibility !== 'hidden' &&
+          el.offsetParent !== null;
+        resultado.push({
+          videoId: videoIdExtraido,
+          visivel,
+          larguraPx: Math.round(rect.width),
+          alturaPx: Math.round(rect.height)
+        });
+      });
+      return resultado;
+    }).catch(() => []);
 
     await browser.close();
 
@@ -133,12 +155,15 @@ app.post('/api/verificar-vsl', async (req, res) => {
       const videoId = match[2];
 
       if (!candidatosMap.has(videoId)) {
+        const infoNaTela = infoPlayersNaTela.find((p) => p.videoId === videoId);
         candidatosMap.set(videoId, {
           videoId,
           accountUuid,
           manifestUrl: `https://cdn.converteai.net/${accountUuid}/${videoId}/main.m3u8`,
           primeiraDeteccao: chamada.momento,
-          primeiroTempoMs: chamada.tempoDesdeInicioMs
+          primeiroTempoMs: chamada.tempoDesdeInicioMs,
+          visivelNaPagina: infoNaTela ? infoNaTela.visivel : null,
+          dimensoesNaPagina: infoNaTela ? `${infoNaTela.larguraPx}x${infoNaTela.alturaPx}px` : null
         });
       }
     }
@@ -153,14 +178,18 @@ app.post('/api/verificar-vsl', async (req, res) => {
       });
     }
 
+    const candidatosVisiveis = candidatos.filter((c) => c.visivelNaPagina === true);
+    const melhorPalpite = candidatosVisiveis.length === 1 ? candidatosVisiveis[0].videoId : null;
+
     res.json({
       status: 'ok',
       totalCandidatos: candidatos.length,
       candidatos,
       cliqueRealizado: resultadoClique,
-      recomendacao: candidatos.length > 1
-        ? 'Mais de um vídeo foi detectado. Abra o manifestUrl de cada candidato e confirme visualmente qual é a VSL real antes de subir a campanha.'
-        : 'Apenas um vídeo foi detectado nesta sessão.'
+      melhorPalpite,
+      recomendacao: melhorPalpite
+        ? `O vídeo ${melhorPalpite} é o único marcado como "visivelNaPagina: true" — este é o candidato mais provável de ser a VSL real, pois é o único player que realmente aparece renderizado na tela, não apenas pré-carregado.`
+        : 'Não foi possível identificar com certeza qual player está visível na tela. Abra o manifestUrl de cada candidato e confirme visualmente qual é a VSL real antes de subir a campanha.'
     });
   } catch (err) {
     if (browser) {
