@@ -46,6 +46,39 @@ app.get('/api/teste-navegador', async (req, res) => {
   }
 });
 
+async function tentarCliqueNoPlayer(page) {
+  const seletoresPossiveis = [
+    '[id^="vid_"]',
+    '[class*="vturb"]',
+    '[class*="player"]',
+    'video',
+    'iframe'
+  ];
+
+  for (const seletor of seletoresPossiveis) {
+    try {
+      const elemento = page.locator(seletor).first();
+      const existe = await elemento.count();
+      if (existe > 0) {
+        await elemento.tap({ timeout: 5000 });
+        return { sucesso: true, seletorUsado: seletor };
+      }
+    } catch (e) {
+      // Se esse seletor falhar, tenta o próximo da lista
+    }
+  }
+
+  try {
+    const viewport = page.viewportSize();
+    if (viewport) {
+      await page.touchscreen.tap(viewport.width / 2, viewport.height / 2);
+      return { sucesso: true, seletorUsado: 'centro-da-tela (fallback)' };
+    }
+  } catch (e) {}
+
+  return { sucesso: false, seletorUsado: null };
+}
+
 app.post('/api/verificar-vsl', async (req, res) => {
   const { url } = req.body;
 
@@ -58,6 +91,8 @@ app.post('/api/verificar-vsl', async (req, res) => {
 
   let browser;
   const chamadasCapturadas = [];
+  let cliqueRealizado = false;
+  const inicioMs = Date.now();
 
   try {
     const perfilMobile = devices['iPhone 13'];
@@ -68,7 +103,11 @@ app.post('/api/verificar-vsl', async (req, res) => {
     page.on('request', (request) => {
       const reqUrl = request.url();
       if (reqUrl.includes('converteai.net') && (reqUrl.includes('config.json') || reqUrl.includes('main.m3u8'))) {
-        chamadasCapturadas.push(reqUrl);
+        chamadasCapturadas.push({
+          url: reqUrl,
+          tempoDesdeInicioMs: Date.now() - inicioMs,
+          momento: cliqueRealizado ? 'depois_do_clique' : 'antes_do_clique'
+        });
       }
     });
 
@@ -79,31 +118,49 @@ app.post('/api/verificar-vsl', async (req, res) => {
 
     await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
 
+    const resultadoClique = await tentarCliqueNoPlayer(page);
+    cliqueRealizado = true;
+
+    await page.waitForTimeout(12000);
+
     await browser.close();
 
-    const chamadaManifesto = chamadasCapturadas.find((u) => u.includes('main.m3u8'));
-    const chamadaConfig = chamadasCapturadas.find((u) => u.includes('config.json'));
-    const chamadaEscolhida = chamadaManifesto || chamadaConfig;
+    const candidatosMap = new Map();
+    for (const chamada of chamadasCapturadas) {
+      const match = /converteai\.net\/([a-f0-9-]+)\/(?:players\/)?([a-f0-9]{24})/i.exec(chamada.url);
+      if (!match) continue;
+      const accountUuid = match[1];
+      const videoId = match[2];
 
-    if (!chamadaEscolhida) {
+      if (!candidatosMap.has(videoId)) {
+        candidatosMap.set(videoId, {
+          videoId,
+          accountUuid,
+          manifestUrl: `https://cdn.converteai.net/${accountUuid}/${videoId}/main.m3u8`,
+          primeiraDeteccao: chamada.momento,
+          primeiroTempoMs: chamada.tempoDesdeInicioMs
+        });
+      }
+    }
+
+    const candidatos = Array.from(candidatosMap.values());
+
+    if (candidatos.length === 0) {
       return res.json({
         status: 'nao_encontrado',
-        message: 'Nenhuma chamada de vídeo da Vturb/ConverteAI foi detectada nesta página.',
-        totalChamadasRede: chamadasCapturadas.length
+        message: 'Nenhuma chamada de vídeo da Vturb/ConverteAI foi detectada nesta página, mesmo após simular o clique no player.',
+        cliqueRealizado: resultadoClique
       });
     }
 
-    const match = /converteai\.net\/([a-f0-9-]+)\/(?:players\/)?([a-f0-9]{24})/i.exec(chamadaEscolhida);
-    const accountUuid = match ? match[1] : null;
-    const videoId = match ? match[2] : null;
-
     res.json({
       status: 'ok',
-      videoId,
-      accountUuid,
-      manifestUrl: (videoId && accountUuid) ? `https://cdn.converteai.net/${accountUuid}/${videoId}/main.m3u8` : null,
-      capturedVia: chamadaManifesto ? 'main.m3u8 (rede real)' : 'config.json (rede real)',
-      chamadaOriginal: chamadaEscolhida
+      totalCandidatos: candidatos.length,
+      candidatos,
+      cliqueRealizado: resultadoClique,
+      recomendacao: candidatos.length > 1
+        ? 'Mais de um vídeo foi detectado. Abra o manifestUrl de cada candidato e confirme visualmente qual é a VSL real antes de subir a campanha.'
+        : 'Apenas um vídeo foi detectado nesta sessão.'
     });
   } catch (err) {
     if (browser) {
