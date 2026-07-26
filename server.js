@@ -145,6 +145,25 @@ app.post('/api/verificar-vsl', async (req, res) => {
       return resultado;
     }).catch(() => []);
 
+    const diagnosticoBruto = await page.evaluate(() => {
+      const candidatosDeTag = ['vturb-smartplayer', 'div[id^="vid_"]', 'div[class*="vturb"]', '[id*="player"]', 'iframe'];
+      const achados = [];
+      candidatosDeTag.forEach((seletor) => {
+        try {
+          const els = document.querySelectorAll(seletor);
+          els.forEach((el) => {
+            achados.push({
+              seletorQueEncontrou: seletor,
+              tagName: el.tagName,
+              id: el.id || null,
+              className: (el.className && typeof el.className === 'string') ? el.className : null
+            });
+          });
+        } catch (e) {}
+      });
+      return achados;
+    }).catch((e) => [{ erro: e.message }]);
+
     await browser.close();
 
     const candidatosMap = new Map();
@@ -181,12 +200,13 @@ app.post('/api/verificar-vsl', async (req, res) => {
     const candidatosVisiveis = candidatos.filter((c) => c.visivelNaPagina === true);
     const melhorPalpite = candidatosVisiveis.length === 1 ? candidatosVisiveis[0].videoId : null;
 
-    res.json({
+   res.json({
       status: 'ok',
       totalCandidatos: candidatos.length,
       candidatos,
       cliqueRealizado: resultadoClique,
       melhorPalpite,
+      diagnosticoBruto,
       recomendacao: melhorPalpite
         ? `O vídeo ${melhorPalpite} é o único marcado como "visivelNaPagina: true" — este é o candidato mais provável de ser a VSL real, pois é o único player que realmente aparece renderizado na tela, não apenas pré-carregado.`
         : 'Não foi possível identificar com certeza qual player está visível na tela. Abra o manifestUrl de cada candidato e confirme visualmente qual é a VSL real antes de subir a campanha.'
