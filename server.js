@@ -2,6 +2,9 @@ const express = require('express');
 const cors = require('cors');
 const { chromium, devices } = require('playwright');
 
+let verificacaoEmAndamento = false;
+let navegadorAtivoRef = null;
+
 const app = express();
 app.use(cors());
 app.use(express.json());
@@ -118,14 +121,24 @@ app.post('/api/verificar-vsl', async (req, res) => {
     });
   }
 
+  if (verificacaoEmAndamento) {
+    return res.status(429).json({
+      status: 'error',
+      message: 'Já existe outra verificação em andamento neste momento. Aguarde cerca de 1 minuto e tente novamente.'
+    });
+  }
+
+  verificacaoEmAndamento = true;
+
   let browser;
   const chamadasCapturadas = [];
   let cliqueRealizado = false;
   const inicioMs = Date.now();
 
   try {
-    const perfilMobile = devices['iPhone 13'];
+   const perfilMobile = devices['iPhone 13'];
     browser = await chromium.launch({ headless: true });
+    navegadorAtivoRef = browser;
     const context = await browser.newContext({ ...perfilMobile });
     const page = await context.newPage();
 
@@ -142,7 +155,7 @@ app.post('/api/verificar-vsl', async (req, res) => {
 
     await page.goto(url, {
       waitUntil: 'domcontentloaded',
-      timeout: 25000
+      timeout: 35000
     });
 
     await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
@@ -197,6 +210,8 @@ app.post('/api/verificar-vsl', async (req, res) => {
     }).catch((e) => [{ erro: e.message }]);
 
     await browser.close();
+    navegadorAtivoRef = null;
+    verificacaoEmAndamento = false;
 
     const candidatosMap = new Map();
     for (const chamada of chamadasCapturadas) {
@@ -261,8 +276,21 @@ app.post('/api/verificar-vsl', async (req, res) => {
     if (browser) {
       await browser.close();
     }
+    navegadorAtivoRef = null;
+    verificacaoEmAndamento = false;
     res.status(500).json({ status: 'error', message: err.message });
   }
+});
+
+process.on('SIGTERM', async () => {
+  console.log('[SERVER] SIGTERM recebido — encerrando de forma organizada...');
+  if (navegadorAtivoRef) {
+    try {
+      await navegadorAtivoRef.close();
+      console.log('[SERVER] Navegador fechado corretamente antes de encerrar.');
+    } catch (e) {}
+  }
+  process.exit(0);
 });
 
 app.listen(PORT, () => {
