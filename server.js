@@ -79,6 +79,35 @@ async function tentarCliqueNoPlayer(page) {
   return { sucesso: false, seletorUsado: null };
 }
 
+async function esperarAteEstabilizarCandidatos(page, chamadasCapturadas, opcoes = {}) {
+  const janelaSemNovasMs = opcoes.janelaSemNovasMs || 6000;
+  const tempoMaximoMs = opcoes.tempoMaximoMs || 40000;
+  const intervaloChecagemMs = 1000;
+
+  const inicio = Date.now();
+  let ultimoTotalDeIds = 0;
+  let momentoUltimaNovidade = Date.now();
+
+  while (Date.now() - inicio < tempoMaximoMs) {
+    await page.waitForTimeout(intervaloChecagemMs);
+
+    const idsUnicos = new Set();
+    chamadasCapturadas.forEach((c) => {
+      const match = /converteai\.net\/[a-f0-9-]+\/(?:players\/)?([a-f0-9]{24})/i.exec(c.url);
+      if (match) idsUnicos.add(match[1]);
+    });
+
+    if (idsUnicos.size > ultimoTotalDeIds) {
+      ultimoTotalDeIds = idsUnicos.size;
+      momentoUltimaNovidade = Date.now();
+    }
+
+    if (Date.now() - momentoUltimaNovidade >= janelaSemNovasMs) {
+      break;
+    }
+  }
+}
+
 app.post('/api/verificar-vsl', async (req, res) => {
   const { url } = req.body;
 
@@ -118,10 +147,13 @@ app.post('/api/verificar-vsl', async (req, res) => {
 
     await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
 
-    const resultadoClique = await tentarCliqueNoPlayer(page);
+   const resultadoClique = await tentarCliqueNoPlayer(page);
     cliqueRealizado = true;
 
-    await page.waitForTimeout(20000);
+    await esperarAteEstabilizarCandidatos(page, chamadasCapturadas, {
+      janelaSemNovasMs: 6000,
+      tempoMaximoMs: 40000
+    });
 
     const infoPlayersNaTela = await page.evaluate(() => {
       const elementos = document.querySelectorAll('vturb-smartplayer');
@@ -197,19 +229,33 @@ app.post('/api/verificar-vsl', async (req, res) => {
       });
     }
 
-    const candidatosVisiveis = candidatos.filter((c) => c.visivelNaPagina === true);
-    const melhorPalpite = candidatosVisiveis.length === 1 ? candidatosVisiveis[0].videoId : null;
+   const candidatosOrdenados = [...candidatos].sort((a, b) => a.primeiroTempoMs - b.primeiroTempoMs);
 
-   res.json({
+    let melhorPalpite = null;
+    let motivoPalpite = 'Não foi possível determinar um padrão de atraso claro. Abra o manifestUrl de cada candidato e confirme visualmente qual é a VSL real antes de subir a campanha.';
+
+    if (candidatosOrdenados.length === 1) {
+      melhorPalpite = candidatosOrdenados[0].videoId;
+      motivoPalpite = 'Apenas um vídeo foi detectado nesta sessão.';
+    } else if (candidatosOrdenados.length > 1) {
+      const ultimo = candidatosOrdenados[candidatosOrdenados.length - 1];
+      const penultimo = candidatosOrdenados[candidatosOrdenados.length - 2];
+      const gapMs = ultimo.primeiroTempoMs - penultimo.primeiroTempoMs;
+
+      if (gapMs >= 3000) {
+        melhorPalpite = ultimo.videoId;
+        motivoPalpite = `O vídeo ${ultimo.videoId} apareceu ${(gapMs / 1000).toFixed(1)}s depois do candidato anterior — esse padrão de atraso costuma indicar a VSL real, enquanto os vídeos que aparecem juntos e imediatamente costumam ser iscas.`;
+      }
+    }
+
+    res.json({
       status: 'ok',
       totalCandidatos: candidatos.length,
-      candidatos,
+      candidatos: candidatosOrdenados,
       cliqueRealizado: resultadoClique,
       melhorPalpite,
       diagnosticoBruto,
-      recomendacao: melhorPalpite
-        ? `O vídeo ${melhorPalpite} é o único marcado como "visivelNaPagina: true" — este é o candidato mais provável de ser a VSL real, pois é o único player que realmente aparece renderizado na tela, não apenas pré-carregado.`
-        : 'Não foi possível identificar com certeza qual player está visível na tela. Abra o manifestUrl de cada candidato e confirme visualmente qual é a VSL real antes de subir a campanha.'
+      recomendacao: motivoPalpite
     });
   } catch (err) {
     if (browser) {
