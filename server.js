@@ -82,6 +82,50 @@ async function tentarCliqueNoPlayer(page) {
   return { sucesso: false, seletorUsado: null };
 }
 
+// Extrai o mediaId do Wistia a partir de uma URL de rede capturada
+// (ex.: fast.wistia.com/embed/medias/abcd1234ef.json)
+function extrairMediaIdWistia(reqUrl) {
+  const match = /wistia\.(?:com|net)\/embed\/medias\/([a-z0-9]+)\.json/i.exec(reqUrl);
+  return match ? match[1] : null;
+}
+
+// Consulta a API pública de metadados do Wistia (a mesma que o player usa)
+// para obter a lista de assets (arquivos mp4 reais, em várias resoluções)
+// e retorna o de maior qualidade. Roda dentro da página via page.evaluate
+// para herdar o referer/origin/cookies corretos da sessão do funil.
+async function resolverAssetWistia(page, mediaId) {
+  try {
+    const dados = await page.evaluate(async (id) => {
+      const resp = await fetch(`https://fast.wistia.com/embed/medias/${id}.json`);
+      if (!resp.ok) return null;
+      return resp.json();
+    }, mediaId);
+
+    const assets = dados?.media?.assets || [];
+    if (!assets.length) return null;
+
+    // Prioriza assets do tipo mp4 "original"/maior resolução disponível
+    const mp4s = assets.filter((a) => a.type && a.type.includes('mp4') && a.url);
+    if (!mp4s.length) return null;
+
+    const melhor = mp4s.reduce((maior, atual) => {
+      const larguraAtual = atual.width || 0;
+      const larguraMaior = maior.width || 0;
+      return larguraAtual > larguraMaior ? atual : maior;
+    }, mp4s[0]);
+
+    return {
+      urlDireta: melhor.url,
+      larguraPx: melhor.width || null,
+      alturaPx: melhor.height || null,
+      tipo: melhor.type,
+      nomeVideo: dados?.media?.name || null
+    };
+  } catch (e) {
+    return null;
+  }
+}
+
 async function esperarAteEstabilizarCandidatos(page, chamadasCapturadas, opcoes = {}) {
   const janelaSemNovasMs = opcoes.janelaSemNovasMs || 6000;
   const tempoMaximoMs = opcoes.tempoMaximoMs || 40000;
@@ -132,6 +176,7 @@ app.post('/api/verificar-vsl', async (req, res) => {
 
   let browser;
   const chamadasCapturadas = [];
+  const chamadasWistia = [];
   let cliqueRealizado = false;
   const inicioMs = Date.now();
 
@@ -150,6 +195,20 @@ app.post('/api/verificar-vsl', async (req, res) => {
           tempoDesdeInicioMs: Date.now() - inicioMs,
           momento: cliqueRealizado ? 'depois_do_clique' : 'antes_do_clique'
         });
+      }
+
+      // Detecção de player Wistia: o embed busca seus metadados em
+      // fast.wistia.com/embed/medias/{mediaId}.json
+      if (/wistia\.(?:com|net)\/embed\/medias\//i.test(reqUrl) && reqUrl.includes('.json')) {
+        const mediaId = extrairMediaIdWistia(reqUrl);
+        if (mediaId) {
+          chamadasWistia.push({
+            url: reqUrl,
+            mediaId,
+            tempoDesdeInicioMs: Date.now() - inicioMs,
+            momento: cliqueRealizado ? 'depois_do_clique' : 'antes_do_clique'
+          });
+        }
       }
     });
 
@@ -209,6 +268,16 @@ app.post('/api/verificar-vsl', async (req, res) => {
       return achados;
     }).catch((e) => [{ erro: e.message }]);
 
+    // Resolve os assets reais do Wistia enquanto o navegador ainda está
+    // aberto (a consulta usa fetch() dentro da própria página, herdando
+    // sessão/referer corretos).
+    const mediaIdsWistiaUnicos = [...new Set(chamadasWistia.map((c) => c.mediaId))];
+    const assetsWistiaPorMediaId = new Map();
+    for (const mediaId of mediaIdsWistiaUnicos) {
+      const asset = await resolverAssetWistia(page, mediaId);
+      if (asset) assetsWistiaPorMediaId.set(mediaId, asset);
+    }
+
     await browser.close();
     navegadorAtivoRef = null;
     verificacaoEmAndamento = false;
@@ -234,12 +303,37 @@ app.post('/api/verificar-vsl', async (req, res) => {
       }
     }
 
-    const candidatos = Array.from(candidatosMap.values());
+    const candidatosVturb = Array.from(candidatosMap.values()).map((c) => ({
+      ...c,
+      plataforma: 'vturb'
+    }));
+
+    // Monta os candidatos do Wistia (um por mediaId único), já com o
+    // link direto de download (mp4) resolvido via API de metadados.
+    const candidatosWistiaMap = new Map();
+    for (const chamada of chamadasWistia) {
+      if (candidatosWistiaMap.has(chamada.mediaId)) continue;
+      const asset = assetsWistiaPorMediaId.get(chamada.mediaId);
+      candidatosWistiaMap.set(chamada.mediaId, {
+        videoId: chamada.mediaId,
+        plataforma: 'wistia',
+        nomeVideo: asset ? asset.nomeVideo : null,
+        linkDireto: asset ? asset.urlDireta : null,
+        manifestUrl: asset ? asset.urlDireta : null, // mesmo campo que o front-end já consome
+        primeiraDeteccao: chamada.momento,
+        primeiroTempoMs: chamada.tempoDesdeInicioMs,
+        dimensoesNaPagina: asset ? `${asset.larguraPx}x${asset.alturaPx}px` : null,
+        resolvidoComSucesso: !!asset
+      });
+    }
+    const candidatosWistia = Array.from(candidatosWistiaMap.values());
+
+    const candidatos = [...candidatosVturb, ...candidatosWistia];
 
     if (candidatos.length === 0) {
       return res.json({
         status: 'nao_encontrado',
-        message: 'Nenhuma chamada de vídeo da Vturb/ConverteAI foi detectada nesta página, mesmo após simular o clique no player.',
+        message: 'Nenhuma chamada de vídeo da Vturb/ConverteAI ou do Wistia foi detectada nesta página, mesmo após simular o clique no player.',
         cliqueRealizado: resultadoClique
       });
     }
