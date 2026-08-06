@@ -20,6 +20,37 @@ function enfileirarVerificacao(tarefa) {
 }
 
 let navegadorAtivoRef = null;
+let browserPersistente = null;
+
+// Item 8: mantém UM navegador Chromium vivo entre requisições em vez de abrir um processo
+// novo a cada auditoria (economiza ~1-2s de overhead por chamada). Cada requisição ainda
+// ganha seu próprio "contexto" isolado (cookies/sessão/proxy/dispositivo independentes),
+// só o processo pesado do navegador em si é reaproveitado.
+async function garantirBrowserAtivo() {
+  if (browserPersistente && browserPersistente.isConnected()) {
+    return browserPersistente;
+  }
+  browserPersistente = await chromium.launch({ headless: true });
+  navegadorAtivoRef = browserPersistente;
+  browserPersistente.on('disconnected', () => {
+    console.warn('[SERVER] Navegador Chromium persistente foi encerrado — será relançado automaticamente na próxima verificação.');
+    browserPersistente = null;
+    navegadorAtivoRef = null;
+  });
+  return browserPersistente;
+}
+
+// Item 9: erros pensados para o usuário final (validação, configuração faltando) usam essa
+// classe e têm a mensagem exibida normalmente; qualquer outro erro (falha interna do
+// Playwright, do site alvo, etc.) é logado por completo no servidor mas devolve uma
+// mensagem genérica pro cliente, sem vazar detalhe técnico interno.
+class ErroVerificacaoVsl extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'ErroVerificacaoVsl';
+    this.seguroParaExibirAoUsuario = true;
+  }
+}
 
 const app = express();
 app.use(cors());
@@ -231,14 +262,17 @@ app.post('/api/verificar-vsl', async (req, res) => {
     res.json(resultado);
   } catch (err) {
     console.error('[SERVER] Erro ao verificar VSL:', err);
-    res.status(500).json({ status: 'error', message: err.message || 'Falha ao processar a verificação.' });
+    const mensagemParaUsuario = err.seguroParaExibirAoUsuario
+      ? err.message
+      : 'Falha interna ao processar a verificação (o erro completo foi registrado no log do servidor). Tente novamente em instantes — se persistir, me chame com o horário aproximado pra eu conferir o log.';
+    res.status(500).json({ status: 'error', message: mensagemParaUsuario });
   }
 });
 
 async function executarVerificacaoVsl(url, opcoes) {
   const { useMobileUA, useUSAProxy } = opcoes;
 
-  let browser;
+  let context;
   const chamadasCapturadas = [];
   const chamadasWistia = [];
   const chamadasPanda = [];
@@ -247,28 +281,27 @@ async function executarVerificacaoVsl(url, opcoes) {
   const inicioMs = Date.now();
 
   try {
-    // Monta as opções de lançamento do navegador — inclui o proxy dos EUA
-    // quando solicitado pelo checkbox "Testar Anti-Cloaking" do front-end.
-    const launchOptions = { headless: true };
+    // Monta as opções de contexto — inclui o proxy dos EUA quando solicitado pelo
+    // checkbox "Testar Anti-Cloaking" do front-end. O proxy agora é configurado por
+    // CONTEXTO (não mais ao lançar o navegador), já que o navegador em si passou a
+    // ser reaproveitado entre requisições diferentes, que podem ou não pedir proxy.
+    const perfilDispositivo = useMobileUA ? devices['iPhone 13'] : devices['Desktop Chrome'];
+    const contextOptions = { ...perfilDispositivo };
+
     if (useUSAProxy) {
       const proxyServer = process.env.PROXY_USA_SERVER;
       if (!proxyServer) {
-        throw new Error('Proxy EUA foi solicitado, mas o servidor não tem as variáveis de ambiente PROXY_USA_SERVER (e opcionalmente PROXY_USA_USERNAME/PROXY_USA_PASSWORD) configuradas. Configure-as no ambiente de hospedagem para usar esse recurso.');
+        throw new ErroVerificacaoVsl('Proxy EUA foi solicitado, mas o servidor não tem as variáveis de ambiente PROXY_USA_SERVER (e opcionalmente PROXY_USA_USERNAME/PROXY_USA_PASSWORD) configuradas. Configure-as no ambiente de hospedagem para usar esse recurso.');
       }
-      launchOptions.proxy = {
+      contextOptions.proxy = {
         server: proxyServer,
         username: process.env.PROXY_USA_USERNAME || undefined,
         password: process.env.PROXY_USA_PASSWORD || undefined
       };
     }
 
-    // Alterna entre perfil mobile (iPhone 13) e desktop conforme o checkbox
-    // "Checar VSL Mobile" do front-end — antes era sempre mobile, fixo.
-    const perfilDispositivo = useMobileUA ? devices['iPhone 13'] : devices['Desktop Chrome'];
-
-    browser = await chromium.launch(launchOptions);
-    navegadorAtivoRef = browser;
-    const context = await browser.newContext({ ...perfilDispositivo });
+    const browser = await garantirBrowserAtivo();
+    context = await browser.newContext(contextOptions);
     const page = await context.newPage();
 
     page.on('request', (request) => {
@@ -388,8 +421,9 @@ async function executarVerificacaoVsl(url, opcoes) {
       if (asset) assetsWistiaPorMediaId.set(mediaId, asset);
     }
 
-    await browser.close();
-    navegadorAtivoRef = null;
+    // Fecha só o CONTEXTO (sessão/cookies desta requisição) — o navegador Chromium em
+    // si (browserPersistente) continua vivo pra próxima verificação da fila reaproveitar.
+    await context.close();
 
     const candidatosMap = new Map();
     for (const chamada of chamadasCapturadas) {
@@ -511,10 +545,9 @@ async function executarVerificacaoVsl(url, opcoes) {
       recomendacao: motivoPalpite
     };
   } catch (err) {
-    if (browser) {
-      await browser.close();
+    if (context) {
+      await context.close().catch(() => {});
     }
-    navegadorAtivoRef = null;
     throw err;
   }
 }
