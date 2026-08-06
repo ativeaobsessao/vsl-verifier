@@ -2,7 +2,23 @@ const express = require('express');
 const cors = require('cors');
 const { chromium, devices } = require('playwright');
 
-let verificacaoEmAndamento = false;
+// Fila de verificações (substitui o antigo bloqueio "só uma por vez" que devolvia 429).
+// Cada nova requisição entra no fim da fila e é processada assim que a anterior termina,
+// em vez de ser rejeitada — importante para quem audita várias páginas em sequência.
+let filaAtual = Promise.resolve();
+let tamanhoFilaAtual = 0;
+
+function enfileirarVerificacao(tarefa) {
+  tamanhoFilaAtual++;
+  const minhaPosicao = tamanhoFilaAtual;
+  const execucao = filaAtual.then(() => tarefa()).finally(() => {
+    tamanhoFilaAtual--;
+  });
+  // Se uma tarefa falhar, não deve travar a fila para as próximas.
+  filaAtual = execucao.catch(() => {});
+  return { execucao, minhaPosicao };
+}
+
 let navegadorAtivoRef = null;
 
 const app = express();
@@ -15,7 +31,8 @@ app.get('/api/status', (req, res) => {
   res.json({
     status: 'ok',
     service: 'viva-vsl-verifier',
-    version: '0.1.0-esqueleto'
+    version: '0.2.0',
+    tamanhoFilaAtual
   });
 });
 
@@ -49,7 +66,7 @@ app.get('/api/teste-navegador', async (req, res) => {
   }
 });
 
-async function tentarCliqueNoPlayer(page) {
+async function tentarCliqueNoPlayer(page, useMobileUA) {
   const seletoresPossiveis = [
     '[id^="vid_"]',
     '[class*="vturb"]',
@@ -63,7 +80,11 @@ async function tentarCliqueNoPlayer(page) {
       const elemento = page.locator(seletor).first();
       const existe = await elemento.count();
       if (existe > 0) {
-        await elemento.tap({ timeout: 5000 });
+        if (useMobileUA) {
+          await elemento.tap({ timeout: 5000 });
+        } else {
+          await elemento.click({ timeout: 5000 });
+        }
         return { sucesso: true, seletorUsado: seletor };
       }
     } catch (e) {
@@ -74,7 +95,11 @@ async function tentarCliqueNoPlayer(page) {
   try {
     const viewport = page.viewportSize();
     if (viewport) {
-      await page.touchscreen.tap(viewport.width / 2, viewport.height / 2);
+      if (useMobileUA) {
+        await page.touchscreen.tap(viewport.width / 2, viewport.height / 2);
+      } else {
+        await page.mouse.click(viewport.width / 2, viewport.height / 2);
+      }
       return { sucesso: true, seletorUsado: 'centro-da-tela (fallback)' };
     }
   } catch (e) {}
@@ -126,6 +151,34 @@ async function resolverAssetWistia(page, mediaId) {
   }
 }
 
+// O PandaVideo entrega o HLS diretamente via CDN (Bunny CDN), diferente do
+// Wistia — a própria URL de rede capturada já é o link .m3u8 final, sem
+// precisar consultar nenhuma API externa. Padrão observado:
+// https://b-vz-{hash}.(tv.)?pandavideo.com.br/{videoId}/playlist.m3u8
+function extrairInfoPanda(reqUrl) {
+  const match = /(?:pandavideo\.com\.br|b-cdn\.net)\/([a-zA-Z0-9-]+)\/playlist\.m3u8/i.exec(reqUrl);
+  if (!match) return null;
+  return {
+    videoId: match[1],
+    manifestUrl: reqUrl
+  };
+}
+
+// Detecção do YouTube: o embed carrega um iframe com src
+// youtube.com/embed/{videoId} ou youtube-nocookie.com/embed/{videoId}.
+// O próprio videoId (11 caracteres) já é suficiente para montar o link
+// de assistir, que o yt-dlp já sabe baixar nativamente (sem precisar
+// resolver nenhum stream/CDN manualmente).
+function extrairInfoYoutube(reqUrl) {
+  const match = /youtube(?:-nocookie)?\.com\/embed\/([a-zA-Z0-9_-]{11})/i.exec(reqUrl);
+  if (!match) return null;
+  const videoId = match[1];
+  return {
+    videoId,
+    manifestUrl: `https://www.youtube.com/watch?v=${videoId}`
+  };
+}
+
 async function esperarAteEstabilizarCandidatos(page, chamadasCapturadas, opcoes = {}) {
   const janelaSemNovasMs = opcoes.janelaSemNovasMs || 6000;
   const tempoMaximoMs = opcoes.tempoMaximoMs || 40000;
@@ -156,7 +209,7 @@ async function esperarAteEstabilizarCandidatos(page, chamadasCapturadas, opcoes 
 }
 
 app.post('/api/verificar-vsl', async (req, res) => {
-  const { url } = req.body;
+  const { url, useMobileUA = true, useUSAProxy = false } = req.body;
 
   if (!url || typeof url !== 'string') {
     return res.status(400).json({
@@ -165,26 +218,57 @@ app.post('/api/verificar-vsl', async (req, res) => {
     });
   }
 
-  if (verificacaoEmAndamento) {
-    return res.status(429).json({
-      status: 'error',
-      message: 'Já existe outra verificação em andamento neste momento. Aguarde cerca de 1 minuto e tente novamente.'
-    });
+  const { execucao, minhaPosicao } = enfileirarVerificacao(() =>
+    executarVerificacaoVsl(url, { useMobileUA: !!useMobileUA, useUSAProxy: !!useUSAProxy })
+  );
+
+  if (minhaPosicao > 1) {
+    console.log(`[FILA] "${url}" entrou na posição ${minhaPosicao} — aguardando as verificações anteriores terminarem.`);
   }
 
-  verificacaoEmAndamento = true;
+  try {
+    const resultado = await execucao;
+    res.json(resultado);
+  } catch (err) {
+    console.error('[SERVER] Erro ao verificar VSL:', err);
+    res.status(500).json({ status: 'error', message: err.message || 'Falha ao processar a verificação.' });
+  }
+});
+
+async function executarVerificacaoVsl(url, opcoes) {
+  const { useMobileUA, useUSAProxy } = opcoes;
 
   let browser;
   const chamadasCapturadas = [];
   const chamadasWistia = [];
+  const chamadasPanda = [];
+  const chamadasYoutube = [];
   let cliqueRealizado = false;
   const inicioMs = Date.now();
 
   try {
-   const perfilMobile = devices['iPhone 13'];
-    browser = await chromium.launch({ headless: true });
+    // Monta as opções de lançamento do navegador — inclui o proxy dos EUA
+    // quando solicitado pelo checkbox "Testar Anti-Cloaking" do front-end.
+    const launchOptions = { headless: true };
+    if (useUSAProxy) {
+      const proxyServer = process.env.PROXY_USA_SERVER;
+      if (!proxyServer) {
+        throw new Error('Proxy EUA foi solicitado, mas o servidor não tem as variáveis de ambiente PROXY_USA_SERVER (e opcionalmente PROXY_USA_USERNAME/PROXY_USA_PASSWORD) configuradas. Configure-as no ambiente de hospedagem para usar esse recurso.');
+      }
+      launchOptions.proxy = {
+        server: proxyServer,
+        username: process.env.PROXY_USA_USERNAME || undefined,
+        password: process.env.PROXY_USA_PASSWORD || undefined
+      };
+    }
+
+    // Alterna entre perfil mobile (iPhone 13) e desktop conforme o checkbox
+    // "Checar VSL Mobile" do front-end — antes era sempre mobile, fixo.
+    const perfilDispositivo = useMobileUA ? devices['iPhone 13'] : devices['Desktop Chrome'];
+
+    browser = await chromium.launch(launchOptions);
     navegadorAtivoRef = browser;
-    const context = await browser.newContext({ ...perfilMobile });
+    const context = await browser.newContext({ ...perfilDispositivo });
     const page = await context.newPage();
 
     page.on('request', (request) => {
@@ -210,6 +294,32 @@ app.post('/api/verificar-vsl', async (req, res) => {
           });
         }
       }
+
+      // Detecção de player PandaVideo: a própria chamada de rede já é o
+      // link .m3u8 final servido pela CDN (Bunny), sem precisar de API.
+      if (reqUrl.includes('playlist.m3u8') && (reqUrl.includes('pandavideo.com.br') || reqUrl.includes('b-cdn.net'))) {
+        const infoPanda = extrairInfoPanda(reqUrl);
+        if (infoPanda) {
+          chamadasPanda.push({
+            ...infoPanda,
+            tempoDesdeInicioMs: Date.now() - inicioMs,
+            momento: cliqueRealizado ? 'depois_do_clique' : 'antes_do_clique'
+          });
+        }
+      }
+
+      // Detecção de player YouTube: o iframe de embed carrega
+      // youtube.com/embed/{videoId} ou youtube-nocookie.com/embed/{videoId}.
+      if (/youtube(?:-nocookie)?\.com\/embed\//i.test(reqUrl)) {
+        const infoYoutube = extrairInfoYoutube(reqUrl);
+        if (infoYoutube) {
+          chamadasYoutube.push({
+            ...infoYoutube,
+            tempoDesdeInicioMs: Date.now() - inicioMs,
+            momento: cliqueRealizado ? 'depois_do_clique' : 'antes_do_clique'
+          });
+        }
+      }
     });
 
     await page.goto(url, {
@@ -219,7 +329,7 @@ app.post('/api/verificar-vsl', async (req, res) => {
 
     await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
 
-   const resultadoClique = await tentarCliqueNoPlayer(page);
+    const resultadoClique = await tentarCliqueNoPlayer(page, useMobileUA);
     cliqueRealizado = true;
 
     await esperarAteEstabilizarCandidatos(page, chamadasCapturadas, {
@@ -280,7 +390,6 @@ app.post('/api/verificar-vsl', async (req, res) => {
 
     await browser.close();
     navegadorAtivoRef = null;
-    verificacaoEmAndamento = false;
 
     const candidatosMap = new Map();
     for (const chamada of chamadasCapturadas) {
@@ -328,14 +437,49 @@ app.post('/api/verificar-vsl', async (req, res) => {
     }
     const candidatosWistia = Array.from(candidatosWistiaMap.values());
 
-    const candidatos = [...candidatosVturb, ...candidatosWistia];
+    // Monta os candidatos do PandaVideo (um por videoId único) — o
+    // manifestUrl já vem pronto direto da captura de rede.
+    const candidatosPandaMap = new Map();
+    for (const chamada of chamadasPanda) {
+      if (candidatosPandaMap.has(chamada.videoId)) continue;
+      candidatosPandaMap.set(chamada.videoId, {
+        videoId: chamada.videoId,
+        plataforma: 'pandavideo',
+        manifestUrl: chamada.manifestUrl,
+        primeiraDeteccao: chamada.momento,
+        primeiroTempoMs: chamada.tempoDesdeInicioMs,
+        dimensoesNaPagina: null,
+        resolvidoComSucesso: true
+      });
+    }
+    const candidatosPanda = Array.from(candidatosPandaMap.values());
+
+    // Monta os candidatos do YouTube (um por videoId único) — o
+    // manifestUrl é a própria URL pública de assistir, que o yt-dlp
+    // já resolve nativamente (sem necessidade de captura de stream/CDN).
+    const candidatosYoutubeMap = new Map();
+    for (const chamada of chamadasYoutube) {
+      if (candidatosYoutubeMap.has(chamada.videoId)) continue;
+      candidatosYoutubeMap.set(chamada.videoId, {
+        videoId: chamada.videoId,
+        plataforma: 'youtube',
+        manifestUrl: chamada.manifestUrl,
+        primeiraDeteccao: chamada.momento,
+        primeiroTempoMs: chamada.tempoDesdeInicioMs,
+        dimensoesNaPagina: null,
+        resolvidoComSucesso: true
+      });
+    }
+    const candidatosYoutube = Array.from(candidatosYoutubeMap.values());
+
+    const candidatos = [...candidatosVturb, ...candidatosWistia, ...candidatosPanda, ...candidatosYoutube];
 
     if (candidatos.length === 0) {
-      return res.json({
+      return {
         status: 'nao_encontrado',
-        message: 'Nenhuma chamada de vídeo da Vturb/ConverteAI ou do Wistia foi detectada nesta página, mesmo após simular o clique no player.',
+        message: 'Nenhuma chamada de vídeo da Vturb/ConverteAI, Wistia, PandaVideo ou YouTube foi detectada nesta página, mesmo após simular o clique no player.',
         cliqueRealizado: resultadoClique
-      });
+      };
     }
 
    const candidatosOrdenados = [...candidatos].sort((a, b) => a.primeiroTempoMs - b.primeiroTempoMs);
@@ -357,7 +501,7 @@ app.post('/api/verificar-vsl', async (req, res) => {
       }
     }
 
-    res.json({
+    return {
       status: 'ok',
       totalCandidatos: candidatos.length,
       candidatos: candidatosOrdenados,
@@ -365,16 +509,15 @@ app.post('/api/verificar-vsl', async (req, res) => {
       melhorPalpite,
       diagnosticoBruto,
       recomendacao: motivoPalpite
-    });
+    };
   } catch (err) {
     if (browser) {
       await browser.close();
     }
     navegadorAtivoRef = null;
-    verificacaoEmAndamento = false;
-    res.status(500).json({ status: 'error', message: err.message });
+    throw err;
   }
-});
+}
 
 process.on('SIGTERM', async () => {
   console.log('[SERVER] SIGTERM recebido — encerrando de forma organizada...');
