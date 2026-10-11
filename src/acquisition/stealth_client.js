@@ -1,11 +1,10 @@
-const { request } = require('undici');
 const { PYTHON_WORKER_URL } = require('../config/env');
 
 async function scrapeWithStealthWorker(url, options = {}) {
   const { useMobileUA = true, proxyUrl = null, timeoutMs = 35000 } = options;
 
   try {
-    const { statusCode, body } = await request(`${PYTHON_WORKER_URL}/v1/stealth-scrape`, {
+    const response = await fetch(`${PYTHON_WORKER_URL}/v1/stealth-scrape`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json'
@@ -16,11 +15,10 @@ async function scrapeWithStealthWorker(url, options = {}) {
         proxyUrl,
         timeoutMs
       }),
-      headersTimeout: timeoutMs + 5000,
-      bodyTimeout: timeoutMs + 5000
+      signal: AbortSignal.timeout(timeoutMs + 5000)
     });
 
-    if (statusCode !== 200) {
+    if (!response.ok) {
       return {
         success: false,
         networkEvents: [],
@@ -29,7 +27,7 @@ async function scrapeWithStealthWorker(url, options = {}) {
       };
     }
 
-    const data = await body.json();
+    const data = await response.json();
     return {
       success: data.status === 'ok',
       networkEvents: data.networkEvents || [],
@@ -49,12 +47,11 @@ async function scrapeWithStealthWorker(url, options = {}) {
 
 async function isWorkerAvailable() {
   try {
-    const { statusCode } = await request(`${PYTHON_WORKER_URL}/health`, {
+    const response = await fetch(`${PYTHON_WORKER_URL}/health`, {
       method: 'GET',
-      headersTimeout: 2000,
-      bodyTimeout: 2000
+      signal: AbortSignal.timeout(2000)
     });
-    return statusCode === 200;
+    return response.ok;
   } catch (e) {
     return false;
   }

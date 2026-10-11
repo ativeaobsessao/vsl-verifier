@@ -1,4 +1,3 @@
-const { request } = require('undici');
 const { detectors } = require('../detectors');
 
 async function performFastHttpCheck(url, useMobileUA = true) {
@@ -7,18 +6,18 @@ async function performFastHttpCheck(url, useMobileUA = true) {
     : 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36';
 
   try {
-    const { statusCode, headers, body } = await request(url, {
+    const response = await fetch(url, {
       method: 'GET',
       headers: {
         'User-Agent': userAgent,
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
         'Accept-Language': 'pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7'
       },
-      headersTimeout: 6000,
-      bodyTimeout: 6000
+      signal: AbortSignal.timeout(6000)
     });
 
-    const text = await body.text();
+    const statusCode = response.status;
+    const text = await response.text();
 
     const isCloudflare = statusCode === 403 || statusCode === 503 ||
       text.includes('challenges.cloudflare.com') ||

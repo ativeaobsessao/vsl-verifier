@@ -1,5 +1,5 @@
 import os
-from fastapi import FastAPI, HTTpException
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
 from scrapling.fetchers import StealthyFetcher
