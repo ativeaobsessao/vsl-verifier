@@ -1,5 +1,4 @@
-scrapling>=0.4.15
-camoufox>=0.4.0
+scrapling[fetchers]>=0.4.15
 fastapi>=0.115.0
 uvicorn>=0.30.0
 pydantic>=2.8.0
