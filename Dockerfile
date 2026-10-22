@@ -10,12 +10,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
   && rm -rf /var/lib/apt/lists/*
 
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+
 COPY package.json package-lock.json* ./
 RUN npm install
 
 COPY requirements.txt ./
 RUN pip3 install --no-cache-dir -r requirements.txt
 RUN patchright install chromium || python3 -m patchright install chromium || true
+RUN npx playwright install chromium || true
 
 COPY . .
 

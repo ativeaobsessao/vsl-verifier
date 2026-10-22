@@ -133,6 +133,12 @@ async def stealth_scrape(req: ScrapeRequest):
         "google_search": True,
         "allow_webgl": True,
         "solve_cloudflare": req.solveCloudflare,
+        "extra_flags": [
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-gpu"
+        ],
         "capture_xhr": r"(converteai|b-cdn|pandavideo|wistia|youtube|m3u8|checkout|hotmart|kiwify|eduzz|monetizze|braip|yampi)"
     }
 

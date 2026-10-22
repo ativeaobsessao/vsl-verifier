@@ -11,11 +11,13 @@ class VturbDetector extends BaseDetector {
     // 1. Regex de videos e manifestos padrao
     // Ex: cdn.converteai.net/{accountUuid}/{videoId}/main.m3u8
     // Ex: scripts.converteai.net/{accountUuid}/players/{videoId}/player.js
+    // Ex: scripts.converteai.net/{accountUuid}/players/{videoId}/v4/player.js
     const regexVturb = /(?:cdn|scripts)?\.?converteai\.net\/([a-f0-9-]+)\/(?:players\/|layers\/)?([a-f0-9]{24})/i;
 
     // 2. Regex de testes A/B
     // Ex: scripts.converteai.net/{accountUuid}/test/{testId}/player.js
-    const regexTestAB = /scripts\.converteai\.net\/([a-f0-9-]+)\/test\/([a-zA-Z0-9-_]+)\/player\.js/i;
+    // Ex: scripts.converteai.net/{accountUuid}/ab-test/{testId}/player.js
+    const regexTestAB = /(?:scripts\.)?converteai\.net\/([a-f0-9-]+)\/(?:test|ab-test)\/([a-zA-Z0-9-_]+)\/player\.js/i;
 
     for (const ev of networkEvents) {
       const url = ev.url || '';
@@ -101,8 +103,8 @@ class VturbDetector extends BaseDetector {
       });
     }
 
-    // 2. Scripts loader: scripts.converteai.net/{accountUuid}/players/{videoId}/player.js
-    const regexScript = /scripts\.converteai\.net\/([a-f0-9-]+)\/players\/([a-f0-9]{24})\/player\.js/gi;
+    // 2. Scripts loader: scripts.converteai.net/{accountUuid}/players/{videoId}/(v4/)?player.js
+    const regexScript = /(?:scripts\.)?converteai\.net\/([a-f0-9-]+)\/players\/([a-f0-9]{24})(?:\/v\d+)?\/player\.js/gi;
     while ((match = regexScript.exec(html)) !== null) {
       const accountUuid = match[1];
       const videoId = match[2];
@@ -122,8 +124,29 @@ class VturbDetector extends BaseDetector {
       });
     }
 
-    // 3. Testes A/B em script: scripts.converteai.net/{accountUuid}/test/{testId}/player.js
-    const regexTestScript = /scripts\.converteai\.net\/([a-f0-9-]+)\/test\/([a-zA-Z0-9-_]+)\/player\.js/gi;
+    // 3. Manifestos diretos em HTML: converteai.net/{accountUuid}/{videoId}/main.m3u8
+    const regexM3u8 = /(?:cdn\.)?converteai\.net\/([a-f0-9-]+)\/([a-f0-9]{24})\/main\.m3u8/gi;
+    while ((match = regexM3u8.exec(html)) !== null) {
+      const accountUuid = match[1];
+      const videoId = match[2];
+      if (vistos.has(videoId)) continue;
+      vistos.add(videoId);
+
+      candidatos.push({
+        videoId,
+        accountUuid,
+        plataforma: 'vturb',
+        manifestUrl: `https://cdn.converteai.net/${accountUuid}/${videoId}/main.m3u8`,
+        primeiraDeteccao: 'fast_http',
+        primeiroTempoMs: 0,
+        visivelNaPagina: true,
+        dimensoesNaPagina: null,
+        resolvidoComSucesso: true
+      });
+    }
+
+    // 4. Testes A/B em script: scripts.converteai.net/{accountUuid}/(test|ab-test)/{testId}/player.js
+    const regexTestScript = /(?:scripts\.)?converteai\.net\/([a-f0-9-]+)\/(?:test|ab-test)\/([a-zA-Z0-9-_]+)\/player\.js/gi;
     while ((match = regexTestScript.exec(html)) !== null) {
       const accountUuid = match[1];
       const testId = match[2];

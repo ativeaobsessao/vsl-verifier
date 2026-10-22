@@ -16,7 +16,17 @@ async function garantirBrowserAtivo() {
   if (browserPersistente && browserPersistente.isConnected()) {
     return browserPersistente;
   }
-  browserPersistente = await chromium.launch({ headless: true });
+  browserPersistente = await chromium.launch({
+    headless: true,
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-gpu',
+      '--no-first-run',
+      '--no-zygote'
+    ]
+  });
   browserPersistente.on('disconnected', () => {
     logger.warn('BROWSER_DISCONNECTED', { msg: 'Browser persistente desconectado.' });
     browserPersistente = null;

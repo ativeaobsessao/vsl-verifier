@@ -21,6 +21,52 @@ app.get('/api/status', (req, res) => {
   });
 });
 
+app.all('/api/proxy-html', async (req, res) => {
+  const targetUrl = req.method === 'POST' ? req.body?.url : req.query?.url;
+  const useMobile = req.method === 'POST' ? req.body?.useMobileUA !== false : req.query?.useMobile !== 'false';
+
+  if (!targetUrl) {
+    return res.status(400).json({ error: 'URL obrigatoria' });
+  }
+
+  try {
+    const safeUrl = await validateUrlSecurity(targetUrl);
+    const userAgent = useMobile
+      ? 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1'
+      : 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36';
+
+    const resp = await fetch(safeUrl, {
+      method: 'GET',
+      headers: {
+        'User-Agent': userAgent,
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7'
+      },
+      signal: AbortSignal.timeout(15000)
+    });
+
+    const html = await resp.text();
+    const headersObj = {};
+    if (resp.headers && typeof resp.headers.forEach === 'function') {
+      resp.headers.forEach((val, key) => { headersObj[key.toLowerCase()] = val; });
+    }
+
+    res.json({
+      success: resp.ok,
+      status: resp.status,
+      html,
+      headers: headersObj,
+      url: safeUrl
+    });
+  } catch (err) {
+    res.status(502).json({
+      success: false,
+      error: err.message,
+      url: targetUrl
+    });
+  }
+});
+
 app.post('/api/verificar-vsl', async (req, res) => {
   const { url, useMobileUA = true, useUSAProxy = false } = req.body;
 
