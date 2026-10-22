@@ -13,21 +13,34 @@ async function performFastHttpCheck(url, useMobileUA = true) {
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
         'Accept-Language': 'pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7'
       },
-      signal: AbortSignal.timeout(6000)
+      signal: AbortSignal.timeout(7000)
     });
 
     const statusCode = response.status;
     const text = await response.text();
+    const serverHeader = (response.headers.get('server') || '').toLowerCase();
+    const cfRay = response.headers.get('cf-ray');
+    const cfMitigated = response.headers.get('cf-mitigated');
 
-    const isCloudflare = statusCode === 403 || statusCode === 503 ||
+    const isCloudflare = (
+      statusCode === 403 ||
+      statusCode === 503 ||
+      !!cfMitigated ||
+      (!!cfRay && (statusCode >= 400 || text.includes('cf-'))) ||
+      serverHeader.includes('cloudflare') && (statusCode === 403 || statusCode === 503) ||
       text.includes('challenges.cloudflare.com') ||
       text.includes('cf-turnstile') ||
-      text.includes('<title>Just a moment...</title>');
+      text.includes('cf-browser-verification') ||
+      text.includes('<title>Just a moment...</title>') ||
+      text.includes('Attention Required! | Cloudflare') ||
+      text.includes('Cloudflare Ray ID')
+    );
 
     if (isCloudflare) {
       return {
         eligible: false,
         isCloudflare: true,
+        statusCode,
         candidates: []
       };
     }
@@ -36,11 +49,12 @@ async function performFastHttpCheck(url, useMobileUA = true) {
       return {
         eligible: false,
         isCloudflare: false,
+        statusCode,
         candidates: []
       };
     }
 
-    // Busca rápida nos detectores
+    // Busca rápida nos detectores via HTML
     let candidatosEncontrados = [];
     for (const d of detectors) {
       const achados = d.detectFromHtml(text);
@@ -55,6 +69,7 @@ async function performFastHttpCheck(url, useMobileUA = true) {
       return {
         eligible: true,
         isCloudflare: false,
+        statusCode,
         candidates: validos
       };
     }
@@ -62,12 +77,14 @@ async function performFastHttpCheck(url, useMobileUA = true) {
     return {
       eligible: false,
       isCloudflare: false,
+      statusCode,
       candidates: []
     };
   } catch (err) {
     return {
       eligible: false,
       isCloudflare: false,
+      error: err.message,
       candidates: []
     };
   }

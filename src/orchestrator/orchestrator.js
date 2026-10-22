@@ -4,7 +4,7 @@ const { scrapeWithStealthWorker, isWorkerAvailable } = require('../acquisition/s
 const { detectors } = require('../detectors');
 const scoringEngine = require('../scoring/scoring_engine');
 const logger = require('../utils/logger');
-const { ErroVerificacooVsl } = require('../utils/errors');
+const { ErroVerificacaoVsl } = require('../utils/errors');
 const env = require('../config/env');
 const ConcurrencySemaphore = require('./concurrency');
 
@@ -24,13 +24,37 @@ async function garantirBrowserAtivo() {
   return browserPersistente;
 }
 
+function extrairProxyUrl(useUSAProxy) {
+  if (!useUSAProxy) return null;
+  const server = env.PROXY_USA_SERVER || process.env.PROXY_USA_SERVER;
+  if (!server) {
+    throw new ErroVerificacaoVsl(
+      'Proxy EUA foi solicitado, mas o servidor nao tem as variaveis PROXY_USA_SERVER configuradas.',
+      'PROXY_ERROR'
+    );
+  }
+  const username = env.PROXY_USA_USERNAME || process.env.PROXY_USA_USERNAME;
+  const password = env.PROXY_USA_PASSWORD || process.env.PROXY_USA_PASSWORD;
+
+  if (username && password) {
+    const cleanServer = server.replace(/^https?:\/\//, '');
+    return `http://${encodeURIComponent(username)}:${encodeURIComponent(password)}@${cleanServer}`;
+  }
+  return server.startsWith('http') ? server : `http://${server}`;
+}
+
 async function tentarCliqueNoPlayer(page, useMobileUA) {
   const seletoresPossiveis = [
+    'vturb-smartplayer',
     '[id^="vid_"]',
     '[class*="vturb"]',
+    '[class*="smartplayer"]',
     '[class*="player"]',
-    'videm',
-    'iframe'
+    'video',
+    'iframe[src*="converteai"]',
+    'iframe[src*="pandavideo"]',
+    'iframe[src*="wistia"]',
+    'iframe[src*="youtube"]'
   ];
 
   for (const seletor of seletoresPossiveis) {
@@ -38,7 +62,7 @@ async function tentarCliqueNoPlayer(page, useMobileUA) {
       const elemento = page.locator(seletor).first();
       const existe = await elemento.count();
       if (existe > 0) {
-        if (useMobileUAE) {
+        if (useMobileUA) {
           await elemento.tap({ timeout: 5000 });
         } else {
           await elemento.click({ timeout: 5000 });
@@ -70,7 +94,7 @@ async function esperarAteEstabilizarCandidatos(page, chamadasCapturadas, opcoes 
 
   const inicio = Date.now();
   let ultimoTotalDeIds = 0;
-  let momentoUltimaMovidade = Date.now();
+  let momentoUltimaNovidade = Date.now();
 
   while (Date.now() - inicio < tempoMaximoMs) {
     await page.waitForTimeout(intervaloChecagemMs);
@@ -124,15 +148,47 @@ async function resolverAssetWistia(page, mediaId) {
   }
 }
 
+function processarResultadosDetectores(networkEvents, html, domDiagnostics = [], wistiaAssets = new Map()) {
+  let candidatos = [];
+
+  // 1. Deteccao por rede
+  if (networkEvents && networkEvents.length > 0) {
+    for (const d of detectors) {
+      const achados = d.detectFromNetwork(networkEvents, domDiagnostics, wistiaAssets);
+      if (achados && achados.length > 0) candidatos = candidatos.concat(achados);
+    }
+  }
+
+  // 2. Deteccao por HTML (caso haja tags declaradas no DOM)
+  if (html) {
+    for (const d of detectors) {
+      const achados = d.detectFromHtml(html);
+      if (achados && achados.length > 0) {
+        for (const item of achados) {
+          const jaExiste = candidatos.some(c => c.videoId === item.videoId && c.plataforma === item.plataforma);
+          if (!jaExiste) {
+            candidatos.push(item);
+          }
+        }
+      }
+    }
+  }
+
+  return candidatos;
+}
+
 async function executarVerificacao(url, opcoes = {}) {
   const { useMobileUA = true, useUSAProxy = false } = opcoes;
   const startTime = Date.now();
 
   logger.info('VERIFICATION_STARTED', { url, useMobileUA, useUSAProxy });
 
+  const proxyUrl = extrairProxyUrl(useUSAProxy);
+
   // 1. TENTATIVA FAST HTTP
+  let fastResult = { eligible: false, isCloudflare: false };
   try {
-    const fastResult = await performFastHttpCheck(url, useMobileUA);
+    fastResult = await performFastHttpCheck(url, useMobileUA);
     if (fastResult.eligible && fastResult.candidates.length > 0) {
       const scored = scoringEngine.evaluate(fastResult.candidates);
       logger.info('FAST_TRACK_SUCCESS', { url, candidates: scored.candidatosOrdenados.length });
@@ -151,21 +207,41 @@ async function executarVerificacao(url, opcoes = {}) {
         }
       };
     }
+  } catch (e) {
+    logger.warn('FAST_HTTP_ERROR', { error: e.message });
+  }
 
-    // 2. TENTATIVA STEALTH WORKER SE FOR CLOUDFLARE
-    const workerReady = await isWorkerAvailable();
-    if (workerReady && fastResult.isCloudflare) {
-      logger.info('DISPATCHING_TO_SCRAPLING_STEALTH', { url });
-      const stealthResult = await scrapeWithStealthWorker(url, { useMobileUA, timeoutMs: 35000 });
-      if (stealthResult.success && stealthResult.networkEvents.length > 0) {
-        let candidatos = [];
-        for (const d of detectors) {
-          const achados = d.detectFromNetwork(stealthResult.networkEvents, []);
-          if (achados.length > 0) candidatos = candidatos.concat(achados);
-        }
+  // 2. TENTATIVA CAMADA 2: SCRAPLING STEALTH WORKER
+  const workerReady = await isWorkerAvailable();
+  const deveUsarStealth = workerReady && (fastResult.isCloudflare || useUSAProxy || true);
+
+  if (deveUsarStealth) {
+    try {
+      logger.info('DISPATCHING_TO_SCRAPLING_STEALTH', {
+        url,
+        motivo: fastResult.isCloudflare ? 'cloudflare_detectado' : (useUSAProxy ? 'proxy_solicitado' : 'stealth_prioritario')
+      });
+
+      const stealthResult = await scrapeWithStealthWorker(url, {
+        useMobileUA,
+        proxyUrl,
+        timeoutMs: 65000,
+        solveCloudflare: true
+      });
+
+      if (stealthResult.success) {
+        const candidatos = processarResultadosDetectores(
+          stealthResult.networkEvents,
+          stealthResult.html
+        );
 
         if (candidatos.length > 0) {
           const scored = scoringEngine.evaluate(candidatos);
+          logger.info('STEALTH_WORKER_CANDIDATES_FOUND', {
+            url,
+            totalCandidatos: scored.candidatosOrdenados.length
+          });
+
           return {
             status: 'ok',
             totalCandidatos: scored.candidatosOrdenados.length,
@@ -177,17 +253,36 @@ async function executarVerificacao(url, opcoes = {}) {
             meta: {
               metodoAquisicao: 'scrapling_stealth',
               duracaoMs: Date.now() - startTime,
-              challengeBypassed: stealthResult.challengeBypassed
+              challengeBypassed: stealthResult.challengeBypassed,
+              proxyUsed: stealthResult.proxyUsed
+            }
+          };
+        } else if (stealthResult.challengeBypassed) {
+          logger.info('STEALTH_WORKER_BYPASSED_NO_VIDEO', { url });
+          return {
+            status: 'nao_encontrado',
+            message: 'A pagina foi acessada com sucesso pelo motor stealth, mas nenhum player suportado (Vturb/ConverteAI, PandaVideo, Wistia ou YouTube) foi detectado.',
+            cliqueRealizado: { sucesso: true, seletorUsado: 'scrapling-stealth' },
+            meta: {
+              metodoAquisicao: 'scrapling_stealth',
+              duracaoMs: Date.now() - startTime,
+              challengeBypassed: true,
+              proxyUsed: stealthResult.proxyUsed
             }
           };
         }
+      } else {
+        logger.warn('STEALTH_WORKER_UNSUCCESSFUL', {
+          error: stealthResult.error,
+          url
+        });
       }
+    } catch (err) {
+      logger.error('STEALTH_WORKER_EXECUTION_ERROR', { error: err.message, url });
     }
-  } catch (e) {
-    logger.warn('FAST_HTTP_OR_STEALTH_SKIPPED', { error: e.message });
   }
 
-  // 3. TENTATIVA INTINCA ATUAL: PLAYWRIGHT
+  // 3. TENTATIVA CAMADA 3: PLAYWRIGHT BROWSER (FALLBACK)
   let context;
   const chamadasCapturadas = [];
   let cliqueRealizado = false;
@@ -262,7 +357,7 @@ async function executarVerificacao(url, opcoes = {}) {
     }).catch(() => []);
 
     const diagnosticoBruto = await page.evaluate(() => {
-      const candidatosDeTag = ['vturb-smartplayer', 'div[id^="vid_"]', 'div[lass*="vturb"]', '[idj="player"]', 'iframe'];
+      const candidatosDeTag = ['vturb-smartplayer', 'div[id^="vid_"]', 'div[class*="vturb"]', '[id="player"]', 'iframe'];
       const achados = [];
       candidatosDeTag.forEach((seletor) => {
         try {
