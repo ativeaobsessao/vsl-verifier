@@ -1,4 +1,4 @@
-const { detectors } = require('../detectors');
+const { detectors, checkout } = require('../detectors');
 
 async function performFastHttpCheck(url, useMobileUA = true) {
   const userAgent = useMobileUA
@@ -27,7 +27,7 @@ async function performFastHttpCheck(url, useMobileUA = true) {
       statusCode === 503 ||
       !!cfMitigated ||
       (!!cfRay && (statusCode >= 400 || text.includes('cf-'))) ||
-      serverHeader.includes('cloudflare') && (statusCode === 403 || statusCode === 503) ||
+      (serverHeader.includes('cloudflare') && (statusCode === 403 || statusCode === 503)) ||
       text.includes('challenges.cloudflare.com') ||
       text.includes('cf-turnstile') ||
       text.includes('cf-browser-verification') ||
@@ -41,7 +41,8 @@ async function performFastHttpCheck(url, useMobileUA = true) {
         eligible: false,
         isCloudflare: true,
         statusCode,
-        candidates: []
+        candidates: [],
+        checkouts: []
       };
     }
 
@@ -50,9 +51,13 @@ async function performFastHttpCheck(url, useMobileUA = true) {
         eligible: false,
         isCloudflare: false,
         statusCode,
-        candidates: []
+        candidates: [],
+        checkouts: []
       };
     }
+
+    // Busca de checkouts no HTML
+    const checkoutsEncontrados = checkout.detectFromHtml(text);
 
     // Busca rápida nos detectores via HTML
     let candidatosEncontrados = [];
@@ -70,7 +75,8 @@ async function performFastHttpCheck(url, useMobileUA = true) {
         eligible: true,
         isCloudflare: false,
         statusCode,
-        candidates: validos
+        candidates: validos,
+        checkouts: checkoutsEncontrados
       };
     }
 
@@ -78,14 +84,16 @@ async function performFastHttpCheck(url, useMobileUA = true) {
       eligible: false,
       isCloudflare: false,
       statusCode,
-      candidates: []
+      candidates: [],
+      checkouts: checkoutsEncontrados
     };
   } catch (err) {
     return {
       eligible: false,
       isCloudflare: false,
       error: err.message,
-      candidates: []
+      candidates: [],
+      checkouts: []
     };
   }
 }

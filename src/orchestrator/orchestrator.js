@@ -1,7 +1,7 @@
 const { chromium, devices } = require('playwright');
 const { performFastHttpCheck } = require('../acquisition/fast_http');
 const { scrapeWithStealthWorker, isWorkerAvailable } = require('../acquisition/stealth_client');
-const { detectors } = require('../detectors');
+const { detectors, checkout } = require('../detectors');
 const scoringEngine = require('../scoring/scoring_engine');
 const logger = require('../utils/logger');
 const { ErroVerificacaoVsl } = require('../utils/errors');
@@ -177,6 +177,33 @@ function processarResultadosDetectores(networkEvents, html, domDiagnostics = [],
   return candidatos;
 }
 
+function processarCheckouts(networkEvents, html) {
+  const checkouts = [];
+  const vistos = new Set();
+
+  if (html) {
+    const achadosHtml = checkout.detectFromHtml(html);
+    for (const chk of achadosHtml) {
+      if (!vistos.has(chk.url)) {
+        vistos.add(chk.url);
+        checkouts.push(chk);
+      }
+    }
+  }
+
+  if (networkEvents && networkEvents.length > 0) {
+    const achadosRede = checkout.detectFromNetwork(networkEvents);
+    for (const chk of achadosRede) {
+      if (!vistos.has(chk.url)) {
+        vistos.add(chk.url);
+        checkouts.push(chk);
+      }
+    }
+  }
+
+  return checkouts;
+}
+
 async function executarVerificacao(url, opcoes = {}) {
   const { useMobileUA = true, useUSAProxy = false } = opcoes;
   const startTime = Date.now();
@@ -186,7 +213,7 @@ async function executarVerificacao(url, opcoes = {}) {
   const proxyUrl = extrairProxyUrl(useUSAProxy);
 
   // 1. TENTATIVA FAST HTTP
-  let fastResult = { eligible: false, isCloudflare: false };
+  let fastResult = { eligible: false, isCloudflare: false, checkouts: [] };
   try {
     fastResult = await performFastHttpCheck(url, useMobileUA);
     if (fastResult.eligible && fastResult.candidates.length > 0) {
@@ -201,6 +228,8 @@ async function executarVerificacao(url, opcoes = {}) {
         melhorPalpite: scored.melhorPalpite,
         diagnosticoBruto: [],
         recomendacao: scored.recomendacao,
+        totalCheckouts: fastResult.checkouts ? fastResult.checkouts.length : 0,
+        checkouts: fastResult.checkouts || [],
         meta: {
           metodoAquisicao: 'fast_http',
           duracaoMs: Date.now() - startTime
@@ -235,11 +264,17 @@ async function executarVerificacao(url, opcoes = {}) {
           stealthResult.html
         );
 
+        const checkouts = processarCheckouts(
+          stealthResult.networkEvents,
+          stealthResult.html
+        );
+
         if (candidatos.length > 0) {
           const scored = scoringEngine.evaluate(candidatos);
           logger.info('STEALTH_WORKER_CANDIDATES_FOUND', {
             url,
-            totalCandidatos: scored.candidatosOrdenados.length
+            totalCandidatos: scored.candidatosOrdenados.length,
+            totalCheckouts: checkouts.length
           });
 
           return {
@@ -250,6 +285,8 @@ async function executarVerificacao(url, opcoes = {}) {
             melhorPalpite: scored.melhorPalpite,
             diagnosticoBruto: [],
             recomendacao: scored.recomendacao,
+            totalCheckouts: checkouts.length,
+            checkouts,
             meta: {
               metodoAquisicao: 'scrapling_stealth',
               duracaoMs: Date.now() - startTime,
@@ -263,6 +300,8 @@ async function executarVerificacao(url, opcoes = {}) {
             status: 'nao_encontrado',
             message: 'A pagina foi acessada com sucesso pelo motor stealth, mas nenhum player suportado (Vturb/ConverteAI, PandaVideo, Wistia ou YouTube) foi detectado.',
             cliqueRealizado: { sucesso: true, seletorUsado: 'scrapling-stealth' },
+            totalCheckouts: checkouts.length,
+            checkouts,
             meta: {
               metodoAquisicao: 'scrapling_stealth',
               duracaoMs: Date.now() - startTime,
@@ -387,6 +426,7 @@ async function executarVerificacao(url, opcoes = {}) {
       if (asset) assetsWistiaPorMediaId.set(id, asset);
     }
 
+    const pageContent = await page.content().catch(() => '');
     await context.close();
 
     let todosCandidatos = [];
@@ -395,11 +435,28 @@ async function executarVerificacao(url, opcoes = {}) {
       if (achados.length > 0) todosCandidatos = todosCandidatos.concat(achados);
     }
 
+    // Se houve tags HTML adicionais
+    if (pageContent) {
+      for (const d of detectors) {
+        const achados = d.detectFromHtml(pageContent);
+        if (achados && achados.length > 0) {
+          for (const item of achados) {
+            const jaExiste = todosCandidatos.some(c => c.videoId === item.videoId && c.plataforma === item.plataforma);
+            if (!jaExiste) todosCandidatos.push(item);
+          }
+        }
+      }
+    }
+
+    const checkouts = processarCheckouts(chamadasCapturadas, pageContent);
+
     if (todosCandidatos.length === 0) {
       return {
         status: 'nao_encontrado',
         message: 'Nenhuma chamada de video da Vturb/ConverteAI, Wistia, PandaVideo ou YouTube foi detectada nesta pagina, mesmo apos simular o clique no player.',
         cliqueRealizado: resultadoClique,
+        totalCheckouts: checkouts.length,
+        checkouts,
         meta: {
           metodoAquisicao: 'playwright_browser',
           duracaoMs: Date.now() - startTime
@@ -417,6 +474,8 @@ async function executarVerificacao(url, opcoes = {}) {
       melhorPalpite: scored.melhorPalpite,
       diagnosticoBruto,
       recomendacao: scored.recomendacao,
+      totalCheckouts: checkouts.length,
+      checkouts,
       meta: {
         metodoAquisicao: 'playwright_browser',
         duracaoMs: Date.now() - startTime

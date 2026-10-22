@@ -6,7 +6,7 @@ class YoutubeDetector extends BaseDetector {
   }
 
   extrairInfoYoutube(reqUrl) {
-    const match = /youtube(?:-nocookie)?\.com\/embed\/([a-eA-Z0-9_-]{11})/i.exec(reqUrl);
+    const match = /youtube(?:-nocookie)?\.com\/embed\/([a-zA-Z0-9_-]{11})/i.exec(reqUrl);
     if (!match) return null;
     const videoId = match[1];
     return {
@@ -42,13 +42,13 @@ class YoutubeDetector extends BaseDetector {
   detectFromHtml(html) {
     if (!html) return [];
     const candidatos = [];
-    const regex = /youtube(?:-nocookie)?\.com\/embed\/([a-eA-Z0-9_-]{11})/gi;
+    const regex = /youtube(?:-nocookie)?\.com\/embed\/([a-zA-Z0-9_-]{11})/gi;
     let match;
     const vistos = new Set();
     while ((match = regex.exec(html)) !== null) {
       const videoId = match[1];
-      if (vistos.has(mediaId)) continue;
-      vistos.add(mediaId);
+      if (vistos.has(videoId)) continue;
+      vistos.add(videoId);
       candidatos.push({
         videoId,
         plataforma: 'youtube',
