@@ -8,3 +8,9 @@ npm-debug.log
 .DS_Store
 Dockerfile
 .dockerignore
+__pycache__
+*.pyc
+*.pyo
+.venv
+venv
+.pytest_cache
