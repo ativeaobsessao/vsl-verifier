@@ -467,6 +467,7 @@ async function executarVerificacao(url, opcoes = {}) {
         cliqueRealizado: resultadoClique,
         totalCheckouts: checkouts.length,
         checkouts,
+        html: pageContent,
         meta: {
           metodoAquisicao: 'playwright_browser',
           duracaoMs: Date.now() - startTime
@@ -486,6 +487,7 @@ async function executarVerificacao(url, opcoes = {}) {
       recomendacao: scored.recomendacao,
       totalCheckouts: checkouts.length,
       checkouts,
+      html: pageContent,
       meta: {
         metodoAquisicao: 'playwright_browser',
         duracaoMs: Date.now() - startTime
