@@ -360,12 +360,24 @@ async function executarVerificacao(url, opcoes = {}) {
     context = await browser.newContext(contextOptions);
     const page = await context.newPage();
 
+    const scriptsCapturados = new Map();
+
     page.on('request', (request) => {
       chamadasCapturadas.push({
         url: request.url(),
         tempoDesdeInicioMs: Date.now() - inicioMs,
         momento: cliqueRealizado ? 'depois_do_clique' : 'antes_do_clique'
       });
+    });
+
+    page.on('response', async (res) => {
+      try {
+        const u = res.url();
+        if (u.includes('converteai.net') && (u.includes('player.js') || u.includes('ab-test') || u.includes('config.json'))) {
+          const t = await res.text();
+          scriptsCapturados.set(u, t);
+        }
+      } catch (e) {}
     });
 
     await page.goto(url, {
@@ -439,16 +451,46 @@ async function executarVerificacao(url, opcoes = {}) {
     const pageContent = await page.content().catch(() => '');
     await context.close();
 
+    // Backup de resolucao de Testes A/B e Scripts VTurb:
+    // Se o script de player.js ou ab-test foi detectado no HTML ou na rede mas nao foi capturado, busca via fetch rapido
+    const regexAbUrl = /(?:https?:)?\/\/(?:scripts\.)?converteai\.net\/[a-f0-9-]+\/(?:test|ab-test)\/[a-zA-Z0-9-_]+\/player\.js/gi;
+    let abMatch;
+    const urlsParaBuscar = new Set();
+    while ((abMatch = regexAbUrl.exec(pageContent)) !== null) {
+      let u = abMatch[0];
+      if (u.startsWith('//')) u = 'https:' + u;
+      urlsParaBuscar.add(u);
+    }
+    for (const c of chamadasCapturadas) {
+      if (c.url && /converteai\.net\/[a-f0-9-]+\/(?:test|ab-test)\/[a-zA-Z0-9-_]+\/player\.js/i.test(c.url)) {
+        urlsParaBuscar.add(c.url);
+      }
+    }
+    for (const sUrl of urlsParaBuscar) {
+      if (!scriptsCapturados.has(sUrl)) {
+        try {
+          const r = await fetch(sUrl, {
+            headers: { 'Referer': url, 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
+            signal: AbortSignal.timeout(8000)
+          });
+          if (r.ok) {
+            const txt = await r.text();
+            scriptsCapturados.set(sUrl, txt);
+          }
+        } catch (e) {}
+      }
+    }
+
     let todosCandidatos = [];
     for (const d of detectors) {
-      const achados = d.detectFromNetwork(chamadasCapturadas, infoPlayersNaTela, assetsWistiaPorMediaId);
+      const achados = d.detectFromNetwork(chamadasCapturadas, infoPlayersNaTela, assetsWistiaPorMediaId, scriptsCapturados);
       if (achados.length > 0) todosCandidatos = todosCandidatos.concat(achados);
     }
 
     // Se houve tags HTML adicionais
     if (pageContent) {
       for (const d of detectors) {
-        const achados = d.detectFromHtml(pageContent);
+        const achados = d.detectFromHtml(pageContent, scriptsCapturados);
         if (achados && achados.length > 0) {
           for (const item of achados) {
             const jaExiste = todosCandidatos.some(c => c.videoId === item.videoId && c.plataforma === item.plataforma);
@@ -459,6 +501,17 @@ async function executarVerificacao(url, opcoes = {}) {
     }
 
     const checkouts = processarCheckouts(chamadasCapturadas, pageContent);
+
+    // Incorpora checkouts ocultos extraidos diretamente dos scripts da VTurb (callActions com delay de pitch)
+    for (const c of todosCandidatos) {
+      if (c.checkoutsExtraidos && Array.isArray(c.checkoutsExtraidos)) {
+        for (const chk of c.checkoutsExtraidos) {
+          if (!checkouts.some(existing => existing.url === chk.url)) {
+            checkouts.push(chk);
+          }
+        }
+      }
+    }
 
     if (todosCandidatos.length === 0) {
       return {
